@@ -21,8 +21,9 @@ import (
 	"io/ioutil"
 	"os"
 	"testing"
+	"time"
 
-	ch "github.com/ethereum/go-ethereum/swarm/chunk"
+	"github.com/ethereum/go-ethereum/swarm/chunk"
 )
 
 var (
@@ -64,7 +65,7 @@ func TestValidator(t *testing.T) {
 	// add content address validator and check puts
 	// bad should fail, good should pass
 	store.Validators = append(store.Validators, NewContentAddressValidator(hashfunc))
-	chunks = GenerateRandomChunks(ch.DefaultSize, 2)
+	chunks = GenerateRandomChunks(chunk.DefaultSize, 2)
 	goodChunk = chunks[0]
 	badChunk = chunks[1]
 	copy(badChunk.Data(), goodChunk.Data())
@@ -82,7 +83,7 @@ func TestValidator(t *testing.T) {
 	var negV boolTestValidator
 	store.Validators = append(store.Validators, negV)
 
-	chunks = GenerateRandomChunks(ch.DefaultSize, 2)
+	chunks = GenerateRandomChunks(chunk.DefaultSize, 2)
 	goodChunk = chunks[0]
 	badChunk = chunks[1]
 	copy(badChunk.Data(), goodChunk.Data())
@@ -100,7 +101,7 @@ func TestValidator(t *testing.T) {
 	var posV boolTestValidator = true
 	store.Validators = append(store.Validators, posV)
 
-	chunks = GenerateRandomChunks(ch.DefaultSize, 2)
+	chunks = GenerateRandomChunks(chunk.DefaultSize, 2)
 	goodChunk = chunks[0]
 	badChunk = chunks[1]
 	copy(badChunk.Data(), goodChunk.Data())
@@ -117,7 +118,7 @@ func TestValidator(t *testing.T) {
 
 type boolTestValidator bool
 
-func (self boolTestValidator) Validate(addr Address, data []byte) bool {
+func (self boolTestValidator) Validate(chunk Chunk) bool {
 	return bool(self)
 }
 
@@ -137,10 +138,107 @@ func putChunks(store *LocalStore, chunks ...Chunk) []error {
 
 func put(store *LocalStore, n int, f func(i int64) Chunk) (hs []Address, errs []error) {
 	for i := int64(0); i < int64(n); i++ {
-		chunk := f(ch.DefaultSize)
+		chunk := f(chunk.DefaultSize)
 		err := store.Put(context.TODO(), chunk)
 		errs = append(errs, err)
 		hs = append(hs, chunk.Address())
 	}
 	return hs, errs
+}
+
+// TestGetFrequentlyAccessedChunkWontGetGarbageCollected tests that the most
+// frequently accessed chunk is not garbage collected from LDBStore, i.e.,
+// from disk when we are at the capacity and garbage collector runs. For that
+// we start putting random chunks into the DB while continuously accessing the
+// chunk we care about then check if we can still retrieve it from disk.
+func TestGetFrequentlyAccessedChunkWontGetGarbageCollected(t *testing.T) {
+	ldbCap := defaultGCRatio
+	store, cleanup := setupLocalStore(t, ldbCap)
+	defer cleanup()
+
+	var chunks []Chunk
+	for i := 0; i < ldbCap; i++ {
+		chunks = append(chunks, GenerateRandomChunk(chunk.DefaultSize))
+	}
+
+	mostAccessed := chunks[0].Address()
+	for _, chunk := range chunks {
+		if err := store.Put(context.Background(), chunk); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := store.Get(context.Background(), mostAccessed); err != nil {
+			t.Fatal(err)
+		}
+		// Add time for MarkAccessed() to be able to finish in a separate Goroutine
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	store.DbStore.collectGarbage()
+	if _, err := store.DbStore.Get(context.Background(), mostAccessed); err != nil {
+		t.Logf("most frequntly accessed chunk not found on disk (key: %v)", mostAccessed)
+		t.Fatal(err)
+	}
+
+}
+
+func setupLocalStore(t *testing.T, ldbCap int) (ls *LocalStore, cleanup func()) {
+	t.Helper()
+
+	var err error
+	datadir, err := ioutil.TempDir("", "storage")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	params := &LocalStoreParams{
+		StoreParams: NewStoreParams(uint64(ldbCap), uint(ldbCap), nil, nil),
+	}
+	params.Init(datadir)
+
+	store, err := NewLocalStore(params, nil)
+	if err != nil {
+		_ = os.RemoveAll(datadir)
+		t.Fatal(err)
+	}
+
+	cleanup = func() {
+		store.Close()
+		_ = os.RemoveAll(datadir)
+	}
+
+	return store, cleanup
+}
+
+func TestHas(t *testing.T) {
+	ldbCap := defaultGCRatio
+	store, cleanup := setupLocalStore(t, ldbCap)
+	defer cleanup()
+
+	nonStoredAddr := GenerateRandomChunk(128).Address()
+
+	has := store.Has(context.Background(), nonStoredAddr)
+	if has {
+		t.Fatal("Expected Has() to return false, but returned true!")
+	}
+
+	storeChunks := GenerateRandomChunks(128, 3)
+	for _, ch := range storeChunks {
+		err := store.Put(context.Background(), ch)
+		if err != nil {
+			t.Fatalf("Expected store to store chunk, but it failed: %v", err)
+		}
+
+		has := store.Has(context.Background(), ch.Address())
+		if !has {
+			t.Fatal("Expected Has() to return true, but returned false!")
+		}
+	}
+
+	//let's be paranoic and test again that the non-existent chunk returns false
+	has = store.Has(context.Background(), nonStoredAddr)
+	if has {
+		t.Fatal("Expected Has() to return false, but returned true!")
+	}
+
 }

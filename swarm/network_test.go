@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/swarm/testutil"
+
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/node"
@@ -36,7 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/swarm/api"
 	"github.com/ethereum/go-ethereum/swarm/network/simulation"
 	"github.com/ethereum/go-ethereum/swarm/storage"
-	colorable "github.com/mattn/go-colorable"
+	"github.com/mattn/go-colorable"
 )
 
 var (
@@ -57,12 +59,7 @@ func init() {
 // static and dynamic Swarm nodes in network simulation, by
 // uploading files to every node and retrieving them.
 func TestSwarmNetwork(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		steps    []testSwarmNetworkStep
-		options  *testSwarmNetworkOptions
-		disabled bool
-	}{
+	var tests = []testSwarmNetworkCase{
 		{
 			name: "10_nodes",
 			steps: []testSwarmNetworkStep{
@@ -87,6 +84,61 @@ func TestSwarmNetwork(t *testing.T) {
 			},
 		},
 		{
+			name: "dec_inc_node_count",
+			steps: []testSwarmNetworkStep{
+				{
+					nodeCount: 3,
+				},
+				{
+					nodeCount: 1,
+				},
+				{
+					nodeCount: 5,
+				},
+			},
+			options: &testSwarmNetworkOptions{
+				Timeout: 90 * time.Second,
+			},
+		},
+	}
+
+	if *longrunning {
+		tests = append(tests, longRunningCases()...)
+	} else if testutil.RaceEnabled {
+		tests = shortCaseForRace()
+
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			testSwarmNetwork(t, tc.options, tc.steps...)
+		})
+	}
+}
+
+type testSwarmNetworkCase struct {
+	name    string
+	steps   []testSwarmNetworkStep
+	options *testSwarmNetworkOptions
+}
+
+// testSwarmNetworkStep is the configuration
+// for the state of the simulation network.
+type testSwarmNetworkStep struct {
+	// number of swarm nodes that must be in the Up state
+	nodeCount int
+}
+
+// testSwarmNetworkOptions contains optional parameters for running
+// testSwarmNetwork.
+type testSwarmNetworkOptions struct {
+	Timeout   time.Duration
+	SkipCheck bool
+}
+
+func longRunningCases() []testSwarmNetworkCase {
+	return []testSwarmNetworkCase{
+		{
 			name: "50_nodes",
 			steps: []testSwarmNetworkStep{
 				{
@@ -96,7 +148,6 @@ func TestSwarmNetwork(t *testing.T) {
 			options: &testSwarmNetworkOptions{
 				Timeout: 3 * time.Minute,
 			},
-			disabled: !*longrunning,
 		},
 		{
 			name: "50_nodes_skip_check",
@@ -109,7 +160,6 @@ func TestSwarmNetwork(t *testing.T) {
 				Timeout:   3 * time.Minute,
 				SkipCheck: true,
 			},
-			disabled: !*longrunning,
 		},
 		{
 			name: "inc_node_count",
@@ -127,7 +177,6 @@ func TestSwarmNetwork(t *testing.T) {
 			options: &testSwarmNetworkOptions{
 				Timeout: 90 * time.Second,
 			},
-			disabled: !*longrunning,
 		},
 		{
 			name: "dec_node_count",
@@ -140,24 +189,6 @@ func TestSwarmNetwork(t *testing.T) {
 				},
 				{
 					nodeCount: 3,
-				},
-			},
-			options: &testSwarmNetworkOptions{
-				Timeout: 90 * time.Second,
-			},
-			disabled: !*longrunning,
-		},
-		{
-			name: "dec_inc_node_count",
-			steps: []testSwarmNetworkStep{
-				{
-					nodeCount: 3,
-				},
-				{
-					nodeCount: 1,
-				},
-				{
-					nodeCount: 5,
 				},
 			},
 			options: &testSwarmNetworkOptions{
@@ -186,7 +217,6 @@ func TestSwarmNetwork(t *testing.T) {
 			options: &testSwarmNetworkOptions{
 				Timeout: 5 * time.Minute,
 			},
-			disabled: !*longrunning,
 		},
 		{
 			name: "inc_dec_node_count_skip_check",
@@ -211,23 +241,25 @@ func TestSwarmNetwork(t *testing.T) {
 				Timeout:   5 * time.Minute,
 				SkipCheck: true,
 			},
-			disabled: !*longrunning,
 		},
-	} {
-		if tc.disabled {
-			continue
-		}
-		t.Run(tc.name, func(t *testing.T) {
-			testSwarmNetwork(t, tc.options, tc.steps...)
-		})
 	}
 }
 
-// testSwarmNetworkStep is the configuration
-// for the state of the simulation network.
-type testSwarmNetworkStep struct {
-	// number of swarm nodes that must be in the Up state
-	nodeCount int
+func shortCaseForRace() []testSwarmNetworkCase {
+	// As for now, Travis with -race can only run 8 nodes
+	return []testSwarmNetworkCase{
+		{
+			name: "8_nodes",
+			steps: []testSwarmNetworkStep{
+				{
+					nodeCount: 8,
+				},
+			},
+			options: &testSwarmNetworkOptions{
+				Timeout: 1 * time.Minute,
+			},
+		},
+	}
 }
 
 // file represents the file uploaded on a particular node.
@@ -244,13 +276,6 @@ type check struct {
 	nodeID enode.ID
 }
 
-// testSwarmNetworkOptions contains optional parameters for running
-// testSwarmNetwork.
-type testSwarmNetworkOptions struct {
-	Timeout   time.Duration
-	SkipCheck bool
-}
-
 // testSwarmNetwork is a helper function used for testing different
 // static and dynamic Swarm network simulations.
 // It is responsible for:
@@ -259,6 +284,8 @@ type testSwarmNetworkOptions struct {
 //  - May wait for Kademlia on every node to be healthy.
 //  - Checking if a file is retrievable from all nodes.
 func testSwarmNetwork(t *testing.T, o *testSwarmNetworkOptions, steps ...testSwarmNetworkStep) {
+	t.Helper()
+
 	if o == nil {
 		o = new(testSwarmNetworkOptions)
 	}
@@ -335,7 +362,7 @@ func testSwarmNetwork(t *testing.T, o *testSwarmNetworkOptions, steps ...testSwa
 
 		result := sim.Run(ctx, func(ctx context.Context, sim *simulation.Simulation) error {
 			nodeIDs := sim.UpNodeIDs()
-			shuffle(len(nodeIDs), func(i, j int) {
+			rand.Shuffle(len(nodeIDs), func(i, j int) {
 				nodeIDs[i], nodeIDs[j] = nodeIDs[j], nodeIDs[i]
 			})
 			for _, id := range nodeIDs {
@@ -352,7 +379,7 @@ func testSwarmNetwork(t *testing.T, o *testSwarmNetworkOptions, steps ...testSwa
 			}
 
 			if *waitKademlia {
-				if _, err := sim.WaitTillHealthy(ctx, 2); err != nil {
+				if _, err := sim.WaitTillHealthy(ctx); err != nil {
 					return err
 				}
 			}
@@ -404,7 +431,7 @@ func retrieve(
 	nodeStatusM *sync.Map,
 	totalFoundCount *uint64,
 ) (missing uint64) {
-	shuffle(len(files), func(i, j int) {
+	rand.Shuffle(len(files), func(i, j int) {
 		files[i], files[j] = files[j], files[i]
 	})
 
@@ -498,33 +525,4 @@ func retrieve(
 	log.Info("check stats", "total check count", totalCheckCount, "total files found", atomic.LoadUint64(totalFoundCount), "total errors", errCount)
 
 	return uint64(totalCheckCount) - atomic.LoadUint64(totalFoundCount)
-}
-
-// Backported from stdlib https://golang.org/src/math/rand/rand.go?s=11175:11215#L333
-//
-// Replace with rand.Shuffle from go 1.10 when go 1.9 support is dropped.
-//
-// shuffle pseudo-randomizes the order of elements.
-// n is the number of elements. Shuffle panics if n < 0.
-// swap swaps the elements with indexes i and j.
-func shuffle(n int, swap func(i, j int)) {
-	if n < 0 {
-		panic("invalid argument to Shuffle")
-	}
-
-	// Fisher-Yates shuffle: https://en.wikipedia.org/wiki/Fisher%E2%80%93Yates_shuffle
-	// Shuffle really ought not be called with n that doesn't fit in 32 bits.
-	// Not only will it take a very long time, but with 2³¹! possible permutations,
-	// there's no way that any PRNG can have a big enough internal state to
-	// generate even a minuscule percentage of the possible permutations.
-	// Nevertheless, the right API signature accepts an int n, so handle it as best we can.
-	i := n - 1
-	for ; i > 1<<31-1-1; i-- {
-		j := int(rand.Int63n(int64(i + 1)))
-		swap(i, j)
-	}
-	for ; i > 0; i-- {
-		j := int(rand.Int31n(int32(i + 1)))
-		swap(i, j)
-	}
 }
